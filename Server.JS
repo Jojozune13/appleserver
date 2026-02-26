@@ -22,6 +22,7 @@ const db = admin.firestore();
 // Collections
 const tagsCollection = db.collection('active_tags');
 const connectionsCollection = db.collection('connections');
+const messagesCollection = db.collection('messages');
 
 // Create HTTP server
 const server = http.createServer();
@@ -103,6 +104,12 @@ wss.on('connection', async (ws, req) => {
           break;
         case 'get_active_tags':
           await sendActiveTags(ws);
+          break;
+        case 'send_message':
+          await handleMessage(ws, message, connection);
+          break;
+        case 'get_messages':
+          await fetchMessages(ws, message.limit || 50);
           break;
         case 'ping':
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
@@ -323,6 +330,129 @@ async function broadcastActiveTags() {
     console.log(`Broadcasted ${tags.length} active tags`);
   } catch (error) {
     console.error('Error broadcasting tags:', error);
+  }
+}
+
+// Handle incoming messages
+async function handleMessage(ws, message, connection) {
+  if (!message.text || typeof message.text !== 'string') {
+    ws.send(JSON.stringify({
+      type: 'message_response',
+      success: false,
+      message: 'Message text is required'
+    }));
+    return;
+  }
+
+  if (message.text.trim().length === 0) {
+    ws.send(JSON.stringify({
+      type: 'message_response',
+      success: false,
+      message: 'Message cannot be empty'
+    }));
+    return;
+  }
+
+  // Limit message length (e.g., 1000 characters)
+  if (message.text.length > 1000) {
+    ws.send(JSON.stringify({
+      type: 'message_response',
+      success: false,
+      message: 'Message too long (max 1000 characters)'
+    }));
+    return;
+  }
+
+  try {
+    // Create message object
+    const messageData = {
+      text: message.text.trim(),
+      connectionId: connection.connectionId,
+      tag: connection.tag || 'anonymous',
+      ip: connection.ip,
+      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      timestamp: Date.now()
+    };
+
+    // Store message in Firebase
+    const docRef = await messagesCollection.add(messageData);
+
+    console.log(`Message stored: ${docRef.id} from ${connection.connectionId}`);
+
+    // Send confirmation to sender
+    ws.send(JSON.stringify({
+      type: 'message_response',
+      success: true,
+      message: 'Message sent',
+      messageId: docRef.id
+    }));
+
+    // Broadcast message to all other connections
+    await broadcastMessage(messageData, docRef.id, connection.connectionId);
+
+  } catch (error) {
+    console.error('Error storing message:', error);
+    ws.send(JSON.stringify({
+      type: 'message_response',
+      success: false,
+      message: 'Server error storing message'
+    }));
+  }
+}
+
+// Broadcast message to all other connections
+async function broadcastMessage(messageData, messageId, senderConnectionId) {
+  const broadcastPayload = JSON.stringify({
+    type: 'new_message',
+    messageId,
+    text: messageData.text,
+    from: messageData.tag,
+    connectionId: messageData.connectionId,
+    timestamp: messageData.timestamp
+  });
+
+  activeConnections.forEach((connection, client) => {
+    // Send to all clients except the sender
+    if (client.readyState === WebSocket.OPEN && connection.connectionId !== senderConnectionId) {
+      client.send(broadcastPayload);
+    }
+  });
+
+  console.log(`Broadcasted message to ${activeConnections.size - 1} other connections`);
+}
+
+// Fetch previous messages
+async function fetchMessages(ws, limit) {
+  try {
+    const snapshot = await messagesCollection
+      .orderBy('sentAt', 'desc')
+      .limit(Math.min(limit, 100))
+      .get();
+
+    const messages = [];
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      messages.unshift({
+        messageId: doc.id,
+        text: data.text,
+        from: data.tag,
+        timestamp: data.timestamp,
+        connectionId: data.connectionId
+      });
+    });
+
+    ws.send(JSON.stringify({
+      type: 'message_history',
+      messages: messages,
+      count: messages.length,
+      timestamp: Date.now()
+    }));
+  } catch (error) {
+    console.error('Error fetching messages:', error);
+    ws.send(JSON.stringify({
+      type: 'error',
+      message: 'Error fetching message history'
+    }));
   }
 }
 
