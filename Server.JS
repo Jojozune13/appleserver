@@ -1,4 +1,5 @@
 require('dotenv').config();
+console.log('Environment variables loaded?', process.env.FIREBASE_PROJECT_ID ? 'YES ✅' : 'NO ❌');
 const WebSocket = require('ws');
 const admin = require('firebase-admin');
 const http = require('http');
