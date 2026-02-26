@@ -2,8 +2,13 @@ require('dotenv').config();
 console.log('Environment variables loaded?', process.env.FIREBASE_PROJECT_ID ? 'YES ✅' : 'NO ❌');
 const WebSocket = require('ws');
 const admin = require('firebase-admin');
+const jwt = require('jsonwebtoken');
 const http = require('http');
 const url = require('url');
+
+// JWT Secret (use environment variable or generate one)
+const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-in-production';
+const TOKEN_EXPIRY = '30d'; // Token expires in 30 days
 
 // Initialize Firebase with environment variables
 const serviceAccount = {
@@ -29,7 +34,7 @@ const server = http.createServer();
 const wss = new WebSocket.Server({ server });
 
 // In-memory storage for active connections
-const activeConnections = new Map(); // socket -> { tag, connectionId, lastSeen, ip }
+const activeConnections = new Map(); // socket -> { tag, connectionId, lastSeen, ip, token }
 const ipConnectionCount = new Map(); // ip -> count (for rate limiting)
 
 // Rate limiting config
@@ -55,19 +60,28 @@ wss.on('connection', async (ws, req) => {
   // Generate unique connection ID
   const connectionId = generateConnectionId();
   
+  // Generate JWT token for this device
+  const token = jwt.sign(
+    { connectionId, ip, iat: Date.now() },
+    JWT_SECRET,
+    { expiresIn: TOKEN_EXPIRY }
+  );
+  
   // Store connection
   activeConnections.set(ws, {
     tag: null,
     connectionId,
     ip,
+    token,
     lastSeen: Date.now(),
     connectedAt: Date.now()
   });
 
-  // Send welcome message
+  // Send welcome message with token
   ws.send(JSON.stringify({
     type: 'connected',
     connectionId,
+    token,
     message: 'Connected to AR Tag Server',
     timestamp: new Date().toISOString()
   }));
@@ -93,6 +107,15 @@ wss.on('connection', async (ws, req) => {
       const connection = activeConnections.get(ws);
       if (connection) {
         connection.lastSeen = Date.now();
+      }
+      
+      // Verify token if provided (optional - for security)
+      if (message.token && message.token !== connection.token) {
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: 'Invalid token'
+        }));
+        return;
       }
 
       switch (message.type) {
@@ -368,6 +391,7 @@ async function handleMessage(ws, message, connection) {
     const messageData = {
       text: message.text.trim(),
       connectionId: connection.connectionId,
+      token: connection.token,
       tag: connection.tag || 'anonymous',
       ip: connection.ip,
       sentAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -459,6 +483,17 @@ async function fetchMessages(ws, limit) {
 // Generate unique connection ID
 function generateConnectionId() {
   return 'conn_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+}
+
+// Verify JWT token
+function verifyToken(token) {
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    return decoded;
+  } catch (error) {
+    console.error('Token verification failed:', error.message);
+    return null;
+  }
 }
 
 // Clean up stale connections and IP counts
