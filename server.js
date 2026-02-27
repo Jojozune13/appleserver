@@ -110,7 +110,7 @@ wss.on('connection', async (ws, req) => {
       }
       
       // Verify token if provided (optional - for security)
-      if (message.token && message.token !== connection.token) {
+      if (message.token && connection && message.token !== connection.token) {
         ws.send(JSON.stringify({
           type: 'error',
           message: 'Invalid token'
