@@ -77,7 +77,7 @@ wss.on('connection', async (ws, req) => {
     connectedAt: Date.now()
   });
 
-  // Send welcome message with token
+  // Send welcome message with token (immediately - don't wait for Firebase)
   ws.send(JSON.stringify({
     type: 'connected',
     connectionId,
@@ -86,16 +86,14 @@ wss.on('connection', async (ws, req) => {
     timestamp: new Date().toISOString()
   }));
 
-  // Log connection to Firebase
-  try {
-    await connectionsCollection.doc(connectionId).set({
-      ip,
-      connectedAt: admin.firestore.FieldValue.serverTimestamp(),
-      userAgent: req.headers['user-agent'] || 'unknown'
-    });
-  } catch (error) {
+  // Log connection to Firebase asynchronously (non-blocking)
+  connectionsCollection.doc(connectionId).set({
+    ip,
+    connectedAt: admin.firestore.FieldValue.serverTimestamp(),
+    userAgent: req.headers['user-agent'] || 'unknown'
+  }).catch(error => {
     console.error('Error logging connection:', error);
-  }
+  });
 
   // Handle incoming messages
   ws.on('message', async (data) => {
@@ -250,7 +248,7 @@ async function handleTagRegistration(ws, requestedTag) {
 
     console.log(`Tag registered: ${sanitizedTag} (${connection.connectionId})`);
 
-    // Send success response
+    // Send success response immediately
     ws.send(JSON.stringify({
       type: 'register_response',
       success: true,
@@ -258,8 +256,10 @@ async function handleTagRegistration(ws, requestedTag) {
       tag: sanitizedTag
     }));
 
-    // Broadcast updated tag list to all connections
-    await broadcastActiveTags();
+    // Broadcast updated tag list to all connections (non-blocking)
+    broadcastActiveTags().catch(error => {
+      console.error('Error in broadcastActiveTags:', error);
+    });
 
   } catch (error) {
     console.error('Firebase error during registration:', error);
@@ -276,14 +276,20 @@ async function handleTagUnregistration(ws) {
   const connection = activeConnections.get(ws);
   
   if (connection && connection.tag) {
-    await removeTag(connection.tag, connection.connectionId);
+    const tag = connection.tag;
     connection.tag = null;
     
+    // Send response immediately
     ws.send(JSON.stringify({
       type: 'unregister_response',
       success: true,
       message: 'Tag unregistered'
     }));
+    
+    // Remove tag asynchronously (non-blocking)
+    removeTag(tag, connection.connectionId).catch(error => {
+      console.error('Error in removeTag:', error);
+    });
   }
 }
 
@@ -296,7 +302,9 @@ async function removeTag(tag, connectionId) {
     });
     
     console.log(`Tag removed: ${tag} (${connectionId})`);
-    await broadcastActiveTags();
+    broadcastActiveTags().catch(error => {
+      console.error('Error in broadcastActiveTags:', error);
+    });
   } catch (error) {
     console.error('Error removing tag:', error);
   }
