@@ -28,6 +28,7 @@ const db = admin.firestore();
 const tagsCollection = db.collection('active_tags');
 const connectionsCollection = db.collection('connections');
 const messagesCollection = db.collection('messages');
+const cubeLocationsCollection = db.collection('cube_locations');
 
 // Create HTTP server
 const server = http.createServer();
@@ -131,6 +132,9 @@ wss.on('connection', async (ws, req) => {
           break;
         case 'get_messages':
           await fetchMessages(ws, message.limit || 50);
+          break;
+        case 'cube_location':
+          await handleCubeLocation(ws, message, connection);
           break;
         case 'ping':
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
@@ -432,7 +436,93 @@ async function handleMessage(ws, message, connection) {
   }
 }
 
-// Broadcast message to all other connections
+async function handleCubeLocation(ws, message, connection) {
+  // Validate required fields
+  if (!message.position || !message.rotation) {
+    ws.send(JSON.stringify({
+      type: 'cube_location_response',
+      success: false,
+      message: 'Position and rotation data required'
+    }));
+    return;
+  }
+
+  // Validate position (should have x, y, z)
+  if (typeof message.position !== 'object' || 
+      message.position.x === undefined || 
+      message.position.y === undefined || 
+      message.position.z === undefined) {
+    ws.send(JSON.stringify({
+      type: 'cube_location_response',
+      success: false,
+      message: 'Invalid position format. Expected {x, y, z}'
+    }));
+    return;
+  }
+
+  // Validate rotation (should have x, y, z, w for quaternion or euler angles)
+  if (typeof message.rotation !== 'object' || 
+      message.rotation.x === undefined || 
+      message.rotation.y === undefined || 
+      message.rotation.z === undefined) {
+    ws.send(JSON.stringify({
+      type: 'cube_location_response',
+      success: false,
+      message: 'Invalid rotation format. Expected {x, y, z} or {x, y, z, w}'
+    }));
+    return;
+  }
+
+  try {
+    // Create cube location object
+    const cubeLocationData = {
+      position: {
+        x: parseFloat(message.position.x),
+        y: parseFloat(message.position.y),
+        z: parseFloat(message.position.z)
+      },
+      rotation: {
+        x: parseFloat(message.rotation.x),
+        y: parseFloat(message.rotation.y),
+        z: parseFloat(message.rotation.z),
+        w: message.rotation.w !== undefined ? parseFloat(message.rotation.w) : null
+      },
+      connectionId: connection.connectionId,
+      tag: connection.tag || 'anonymous',
+      ip: connection.ip,
+      cubeId: message.cubeId || `cube_${connection.connectionId}`,
+      timestamp: Date.now(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    // Store or update cube location in Firebase
+    const cubeId = message.cubeId || `cube_${connection.connectionId}`;
+    await cubeLocationsCollection.doc(cubeId).set(cubeLocationData, { merge: true });
+
+    console.log(`Cube location updated: ${cubeId} from ${connection.connectionId}`);
+
+    // Send confirmation to sender
+    ws.send(JSON.stringify({
+      type: 'cube_location_response',
+      success: true,
+      message: 'Cube location updated',
+      cubeId: cubeId,
+      timestamp: Date.now()
+    }));
+
+    // Broadcast cube location to all other connections
+    await broadcastCubeLocation(cubeLocationData, cubeId, connection.connectionId);
+
+  } catch (error) {
+    console.error('Error storing cube location:', error);
+    ws.send(JSON.stringify({
+      type: 'cube_location_response',
+      success: false,
+      message: 'Server error storing cube location'
+    }));
+  }
+}
+
 async function broadcastMessage(messageData, messageId, senderConnectionId) {
   const broadcastPayload = JSON.stringify({
     type: 'new_message',
@@ -451,6 +541,28 @@ async function broadcastMessage(messageData, messageId, senderConnectionId) {
   });
 
   console.log(`Broadcasted message to ${activeConnections.size - 1} other connections`);
+}
+
+// Broadcast cube location to all other connections
+async function broadcastCubeLocation(cubeLocationData, cubeId, senderConnectionId) {
+  const broadcastPayload = JSON.stringify({
+    type: 'cube_location_update',
+    cubeId,
+    position: cubeLocationData.position,
+    rotation: cubeLocationData.rotation,
+    from: cubeLocationData.tag,
+    connectionId: cubeLocationData.connectionId,
+    timestamp: cubeLocationData.timestamp
+  });
+
+  activeConnections.forEach((connection, client) => {
+    // Send to all clients except the sender
+    if (client.readyState === WebSocket.OPEN && connection.connectionId !== senderConnectionId) {
+      client.send(broadcastPayload);
+    }
+  });
+
+  console.log(`Broadcasted cube location to ${activeConnections.size - 1} other connections`);
 }
 
 // Fetch previous messages
@@ -565,5 +677,3 @@ server.listen(PORT, () => {
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`Firebase Project: ${process.env.FIREBASE_PROJECT_ID}`);
 });
-
-//changed name
