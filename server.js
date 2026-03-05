@@ -28,7 +28,7 @@ const db = admin.firestore();
 const tagsCollection = db.collection('active_tags');
 const connectionsCollection = db.collection('connections');
 const messagesCollection = db.collection('messages');
-const cubeLocationsCollection = db.collection('cube_locations');
+const cubesCollection = db.collection('cubes'); // Renamed from cube_locations for clarity
 
 // Create HTTP server
 const server = http.createServer();
@@ -78,16 +78,16 @@ wss.on('connection', async (ws, req) => {
     connectedAt: Date.now()
   });
 
-  // Send welcome message with token (immediately - don't wait for Firebase)
+  // Send welcome message with token
   ws.send(JSON.stringify({
     type: 'connected',
     connectionId,
     token,
-    message: 'Connected to AR Tag Server',
+    message: 'Connected to Flock Server',
     timestamp: new Date().toISOString()
   }));
 
-  // Log connection to Firebase asynchronously (non-blocking)
+  // Log connection to Firebase asynchronously
   connectionsCollection.doc(connectionId).set({
     ip,
     connectedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -108,7 +108,7 @@ wss.on('connection', async (ws, req) => {
         connection.lastSeen = Date.now();
       }
       
-      // Verify token if provided (optional - for security)
+      // Verify token if provided (optional)
       if (message.token && connection && message.token !== connection.token) {
         ws.send(JSON.stringify({
           type: 'error',
@@ -260,7 +260,7 @@ async function handleTagRegistration(ws, requestedTag) {
       tag: sanitizedTag
     }));
 
-    // Broadcast updated tag list to all connections (non-blocking)
+    // Broadcast updated tag list to all connections
     broadcastActiveTags().catch(error => {
       console.error('Error in broadcastActiveTags:', error);
     });
@@ -290,7 +290,7 @@ async function handleTagUnregistration(ws) {
       message: 'Tag unregistered'
     }));
     
-    // Remove tag asynchronously (non-blocking)
+    // Remove tag asynchronously
     removeTag(tag, connection.connectionId).catch(error => {
       console.error('Error in removeTag:', error);
     });
@@ -388,7 +388,7 @@ async function handleMessage(ws, message, connection) {
     return;
   }
 
-  // Limit message length (e.g., 1000 characters)
+  // Limit message length
   if (message.text.length > 1000) {
     ws.send(JSON.stringify({
       type: 'message_response',
@@ -436,18 +436,19 @@ async function handleMessage(ws, message, connection) {
   }
 }
 
+// Handle cube location updates
 async function handleCubeLocation(ws, message, connection) {
   // Validate required fields
-  if (!message.position || !message.rotation) {
+  if (!message.position || !message.rotation || !message.cubeId || !message.ownerTag) {
     ws.send(JSON.stringify({
       type: 'cube_location_response',
       success: false,
-      message: 'Position and rotation data required'
+      message: 'Position, rotation, cubeId, and ownerTag required'
     }));
     return;
   }
 
-  // Validate position (should have x, y, z)
+  // Validate position
   if (typeof message.position !== 'object' || 
       message.position.x === undefined || 
       message.position.y === undefined || 
@@ -460,7 +461,7 @@ async function handleCubeLocation(ws, message, connection) {
     return;
   }
 
-  // Validate rotation (should have x, y, z, w for quaternion or euler angles)
+  // Validate rotation
   if (typeof message.rotation !== 'object' || 
       message.rotation.x === undefined || 
       message.rotation.y === undefined || 
@@ -474,8 +475,9 @@ async function handleCubeLocation(ws, message, connection) {
   }
 
   try {
-    // Create cube location object
-    const cubeLocationData = {
+    // Create cube object
+    const cubeData = {
+      cubeId: message.cubeId,
       position: {
         x: parseFloat(message.position.x),
         y: parseFloat(message.position.y),
@@ -487,42 +489,41 @@ async function handleCubeLocation(ws, message, connection) {
         z: parseFloat(message.rotation.z),
         w: message.rotation.w !== undefined ? parseFloat(message.rotation.w) : null
       },
+      ownerTag: message.ownerTag,
       connectionId: connection.connectionId,
-      tag: connection.tag || 'anonymous',
       ip: connection.ip,
-      cubeId: message.cubeId || `cube_${connection.connectionId}`,
-      timestamp: Date.now(),
+      createdAt: message.createdAt ? new Date(message.createdAt * 1000) : admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     };
 
-    // Store or update cube location in Firebase
-    const cubeId = message.cubeId || `cube_${connection.connectionId}`;
-    await cubeLocationsCollection.doc(cubeId).set(cubeLocationData, { merge: true });
+    // Store cube in Firebase (use cubeId as document ID)
+    await cubesCollection.doc(message.cubeId).set(cubeData, { merge: true });
 
-    console.log(`Cube location updated: ${cubeId} from ${connection.connectionId}`);
+    console.log(`Cube stored: ${message.cubeId} from ${connection.connectionId}`);
 
     // Send confirmation to sender
     ws.send(JSON.stringify({
       type: 'cube_location_response',
       success: true,
       message: 'Cube location updated',
-      cubeId: cubeId,
+      cubeId: message.cubeId,
       timestamp: Date.now()
     }));
 
-    // Broadcast cube location to all other connections
-    await broadcastCubeLocation(cubeLocationData, cubeId, connection.connectionId);
+    // Broadcast cube to all other connections
+    await broadcastCube(cubeData, connection.connectionId);
 
   } catch (error) {
-    console.error('Error storing cube location:', error);
+    console.error('Error storing cube:', error);
     ws.send(JSON.stringify({
       type: 'cube_location_response',
       success: false,
-      message: 'Server error storing cube location'
+      message: 'Server error storing cube'
     }));
   }
 }
 
+// Broadcast message to all other connections
 async function broadcastMessage(messageData, messageId, senderConnectionId) {
   const broadcastPayload = JSON.stringify({
     type: 'new_message',
@@ -534,7 +535,6 @@ async function broadcastMessage(messageData, messageId, senderConnectionId) {
   });
 
   activeConnections.forEach((connection, client) => {
-    // Send to all clients except the sender
     if (client.readyState === WebSocket.OPEN && connection.connectionId !== senderConnectionId) {
       client.send(broadcastPayload);
     }
@@ -543,26 +543,27 @@ async function broadcastMessage(messageData, messageId, senderConnectionId) {
   console.log(`Broadcasted message to ${activeConnections.size - 1} other connections`);
 }
 
-// Broadcast cube location to all other connections
-async function broadcastCubeLocation(cubeLocationData, cubeId, senderConnectionId) {
+// Broadcast cube to all other connections
+async function broadcastCube(cubeData, senderConnectionId) {
   const broadcastPayload = JSON.stringify({
     type: 'cube_location_update',
-    cubeId,
-    position: cubeLocationData.position,
-    rotation: cubeLocationData.rotation,
-    from: cubeLocationData.tag,
-    connectionId: cubeLocationData.connectionId,
-    timestamp: cubeLocationData.timestamp
+    cubeId: cubeData.cubeId,
+    position: cubeData.position,
+    rotation: cubeData.rotation,
+    from: cubeData.ownerTag,
+    ownerTag: cubeData.ownerTag,
+    connectionId: cubeData.connectionId,
+    createdAt: cubeData.createdAt instanceof Date ? cubeData.createdAt.getTime() / 1000 : Date.now() / 1000,
+    timestamp: Date.now()
   });
 
   activeConnections.forEach((connection, client) => {
-    // Send to all clients except the sender
     if (client.readyState === WebSocket.OPEN && connection.connectionId !== senderConnectionId) {
       client.send(broadcastPayload);
     }
   });
 
-  console.log(`Broadcasted cube location to ${activeConnections.size - 1} other connections`);
+  console.log(`Broadcasted cube to ${activeConnections.size - 1} other connections`);
 }
 
 // Fetch previous messages
@@ -628,7 +629,7 @@ setInterval(() => {
     }
   });
 
-  // Clean up IP connection counts (remove entries with 0 connections)
+  // Clean up IP connection counts
   ipConnectionCount.forEach((count, ip) => {
     if (count <= 0) {
       ipConnectionCount.delete(ip);
@@ -673,7 +674,7 @@ process.on('SIGINT', async () => {
 // Start server
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-  console.log(`AR Tag Server running on port ${PORT}`);
+  console.log(`Flock Server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`Firebase Project: ${process.env.FIREBASE_PROJECT_ID}`);
 });
