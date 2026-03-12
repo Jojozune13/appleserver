@@ -34,9 +34,23 @@ const cubesCollection = db.collection('cubes'); // Renamed from cube_locations f
 const server = http.createServer();
 const wss = new WebSocket.Server({ server });
 
+// Load cubes from Firebase on startup
+async function loadCubesFromFirebase() {
+  try {
+    const snapshot = await cubesCollection.get();
+    snapshot.forEach(doc => {
+      cubesCache.set(doc.id, doc.data());
+    });
+    console.log(`Loaded ${cubesCache.size} cubes from Firebase`);
+  } catch (error) {
+    console.error('Error loading cubes from Firebase:', error);
+  }
+}
+
 // In-memory storage for active connections
 const activeConnections = new Map(); // socket -> { tag, connectionId, lastSeen, ip, token }
 const ipConnectionCount = new Map(); // ip -> count (for rate limiting)
+const cubesCache = new Map(); // cubeId -> cube data (persists across client connections)
 
 // Rate limiting config
 const RATE_LIMIT_WINDOW = parseInt(process.env.RATE_LIMIT_WINDOW) || 60000;
@@ -135,6 +149,9 @@ wss.on('connection', async (ws, req) => {
           break;
         case 'cube_location':
           await handleCubeLocation(ws, message, connection);
+          break;
+        case 'get_cubes':
+          await sendCubeList(ws);
           break;
         case 'ping':
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
@@ -499,6 +516,9 @@ async function handleCubeLocation(ws, message, connection) {
     // Store cube in Firebase (use cubeId as document ID)
     await cubesCollection.doc(message.cubeId).set(cubeData, { merge: true });
 
+    // Store in in-memory cache
+    cubesCache.set(message.cubeId, cubeData);
+
     console.log(`Cube stored: ${message.cubeId} from ${connection.connectionId}`);
 
     // Send confirmation to sender
@@ -564,6 +584,28 @@ async function broadcastCube(cubeData, senderConnectionId) {
   });
 
   console.log(`Broadcasted cube to ${activeConnections.size - 1} other connections`);
+}
+
+// Send cube list to a client
+async function sendCubeList(ws) {
+  try {
+    const cubes = Array.from(cubesCache.values());
+    
+    ws.send(JSON.stringify({
+      type: 'cube_list',
+      cubes: cubes,
+      count: cubes.length,
+      timestamp: Date.now()
+    }));
+
+    console.log(`Sent ${cubes.length} cubes to client`);
+  } catch (error) {
+    console.error('Error sending cube list:', error);
+    ws.send(JSON.stringify({
+      type: 'error',
+      message: 'Error fetching cube list'
+    }));
+  }
 }
 
 // Fetch previous messages
@@ -673,8 +715,18 @@ process.on('SIGINT', async () => {
 
 // Start server
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log(`Flock Server running on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`Firebase Project: ${process.env.FIREBASE_PROJECT_ID}`);
+
+// Load cubes from Firebase before starting the server
+loadCubesFromFirebase().then(() => {
+  server.listen(PORT, () => {
+    console.log(`Flock Server running on port ${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`Firebase Project: ${process.env.FIREBASE_PROJECT_ID}`);
+    console.log(`Cubes cache initialized with ${cubesCache.size} cubes`);
+  });
+}).catch(error => {
+  console.error('Failed to load cubes on startup:', error);
+  server.listen(PORT, () => {
+    console.log(`Flock Server running on port ${PORT} (cube load failed, will try again on next request)`);
+  });
 });
