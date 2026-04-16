@@ -29,6 +29,7 @@ const tagsCollection = db.collection('active_tags');
 const connectionsCollection = db.collection('connections');
 const messagesCollection = db.collection('messages');
 const cubesCollection = db.collection('cubes'); // Renamed from cube_locations for clarity
+const questionsCollection = db.collection('questions');
 
 // Create HTTP server
 const server = http.createServer();
@@ -47,10 +48,27 @@ async function loadCubesFromFirebase() {
   }
 }
 
+
+// Load questions from Firebase on startup
+async function loadQuestionsFromFirebase() {
+  try {
+    const snapshot = await questionsCollection
+      .where('isResolved', '==', false)
+      .get();
+    snapshot.forEach(doc => {
+      questionsCache.set(doc.id, doc.data());
+    });
+    console.log(`Loaded ${questionsCache.size} open question(s) from Firebase`);
+  } catch (error) {
+    console.error('Error loading questions from Firebase:', error);
+  }
+}
+
 // In-memory storage for active connections
 const activeConnections = new Map(); // socket -> { tag, connectionId, lastSeen, ip, token }
 const ipConnectionCount = new Map(); // ip -> count (for rate limiting)
-const cubesCache = new Map(); // cubeId -> cube data (persists across client connections)
+const cubesCache = new Map();     // cubeId -> cube data (persists across client connections)
+const questionsCache = new Map();  // questionId -> question data (persists across client connections)
 
 // Rate limiting config
 const RATE_LIMIT_WINDOW = parseInt(process.env.RATE_LIMIT_WINDOW) || 60000;
@@ -72,7 +90,229 @@ wss.on('connection', async (ws, req) => {
   // Increment connection count
   ipConnectionCount.set(ip, currentConnections + 1);
 
-  // Generate unique connection ID
+  
+// ─────────────────────────────────────────────────────────────────────────────
+// QUESTION HANDLERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Helper: does this connection's role allow seeing private questions?
+function canSeePrivate(connection) {
+  return connection.role === 'admin' || connection.role === 'staff';
+}
+
+// Helper: does this connection's role allow resolving questions?
+function canResolve(connection) {
+  return connection.role === 'admin' || connection.role === 'staff';
+}
+
+// Handle send_question / send_private_question
+async function handleQuestion(ws, message, connection) {
+  if (!connection.tag) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Must be registered to ask a question' }));
+    return;
+  }
+
+  const text = (message.text || '').trim();
+  if (!text || text.length > 1000) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Question text required (max 1000 chars)' }));
+    return;
+  }
+
+  const isPrivate = message.type === 'send_private_question' || message.isPrivate === true;
+  const questionId = message.questionId || ('q_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6));
+
+  const questionData = {
+    questionId,
+    askedBy:    connection.tag,
+    targetUser: message.targetUser || null,
+    text,
+    isPrivate,
+    isResolved: false,
+    resolvedBy: null,
+    resolvedAt: null,
+    createdAt:  admin.firestore.FieldValue.serverTimestamp(),
+    createdAtMs: Date.now()
+  };
+
+  try {
+    // Persist to Firestore
+    await questionsCollection.doc(questionId).set(questionData);
+
+    // Store a serialisable copy in the in-memory cache
+    const cached = { ...questionData, createdAt: Date.now() / 1000 };
+    questionsCache.set(questionId, cached);
+
+    console.log(`[Question] ${isPrivate ? 'PRIVATE' : 'public'} question ${questionId} from ${connection.tag}`);
+
+    // Confirm to sender
+    ws.send(JSON.stringify({
+      type: 'question_received',
+      success: true,
+      questionId
+    }));
+
+    // Broadcast to eligible connections
+    broadcastQuestion(cached, connection.connectionId);
+
+  } catch (error) {
+    console.error('Error storing question:', error);
+    ws.send(JSON.stringify({ type: 'error', message: 'Server error storing question' }));
+  }
+}
+
+// Broadcast a new question to all eligible connections
+function broadcastQuestion(questionData, senderConnectionId) {
+  const isPrivate = questionData.isPrivate;
+
+  activeConnections.forEach((conn, client) => {
+    if (client.readyState !== WebSocket.OPEN) return;
+    if (conn.connectionId === senderConnectionId) return; // sender already sees it locally
+
+    // Private question routing:
+    //   • admins and staff always receive it
+    //   • the targeted user (if any) receives it
+    //   • everyone else does NOT
+    if (isPrivate) {
+      const isPrivileged = canSeePrivate(conn);
+      const isTarget     = conn.tag && questionData.targetUser && conn.tag === questionData.targetUser;
+      if (!isPrivileged && !isTarget) return;
+    }
+
+    client.send(JSON.stringify({
+      type: isPrivate ? 'new_private_question' : 'new_question',
+      questionId:  questionData.questionId,
+      askedBy:     questionData.askedBy,
+      targetUser:  questionData.targetUser,
+      text:        questionData.text,
+      isPrivate:   questionData.isPrivate,
+      isResolved:  false,
+      createdAt:   questionData.createdAt
+    }));
+  });
+}
+
+// Handle resolve_question
+async function handleResolveQuestion(ws, message, connection) {
+  if (!connection.tag) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Must be registered to resolve questions' }));
+    return;
+  }
+
+  // Role gate — only staff and admin may resolve
+  if (!canResolve(connection)) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Only staff or admin can resolve questions' }));
+    return;
+  }
+
+  const { questionId, resolvedBy } = message;
+  if (!questionId) {
+    ws.send(JSON.stringify({ type: 'error', message: 'questionId required' }));
+    return;
+  }
+
+  const resolverTag = resolvedBy || connection.tag;
+
+  try {
+    // Update Firestore
+    await questionsCollection.doc(questionId).update({
+      isResolved: true,
+      resolvedBy: resolverTag,
+      resolvedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // Update cache
+    if (questionsCache.has(questionId)) {
+      const q = questionsCache.get(questionId);
+      q.isResolved = true;
+      q.resolvedBy = resolverTag;
+      q.resolvedAt = Date.now() / 1000;
+    } else {
+      // Remove from cache if it wasn't there (already resolved race condition)
+      questionsCache.delete(questionId);
+    }
+
+    console.log(`[Question] ${questionId} resolved by ${resolverTag}`);
+
+    // Confirm to resolver
+    ws.send(JSON.stringify({
+      type: 'question_resolved',
+      questionId,
+      resolvedBy: resolverTag,
+      timestamp: Date.now()
+    }));
+
+    // Broadcast resolution to everyone (public event — safe to send to all)
+    broadcastQuestionResolved(questionId, resolverTag, connection.connectionId);
+
+  } catch (error) {
+    console.error('Error resolving question:', error);
+    ws.send(JSON.stringify({ type: 'error', message: 'Server error resolving question' }));
+  }
+}
+
+// Broadcast a question_resolved event to all connected clients
+function broadcastQuestionResolved(questionId, resolvedBy, senderConnectionId) {
+  const payload = JSON.stringify({
+    type: 'question_resolved',
+    questionId,
+    resolvedBy,
+    timestamp: Date.now()
+  });
+
+  activeConnections.forEach((conn, client) => {
+    if (client.readyState === WebSocket.OPEN && conn.connectionId !== senderConnectionId) {
+      client.send(payload);
+    }
+  });
+}
+
+// Send the question list to a newly-joined client (role-filtered)
+async function sendQuestionList(ws, connection) {
+  try {
+    // Send only open questions from in-memory cache — fastest path
+    const questions = [];
+
+    questionsCache.forEach(q => {
+      if (q.isResolved) return;
+
+      // Apply the same private-visibility rules as the client
+      if (q.isPrivate) {
+        if (!canSeePrivate(connection)) {
+          // Student: only see their own private questions (as asker or target)
+          const isAsker  = connection.tag && q.askedBy    === connection.tag;
+          const isTarget = connection.tag && q.targetUser === connection.tag;
+          if (!isAsker && !isTarget) return;
+        }
+      }
+
+      questions.push({
+        questionId:  q.questionId,
+        askedBy:     q.askedBy,
+        targetUser:  q.targetUser,
+        text:        q.text,
+        isPrivate:   q.isPrivate,
+        isResolved:  q.isResolved,
+        resolvedBy:  q.resolvedBy,
+        createdAt:   q.createdAt
+      });
+    });
+
+    ws.send(JSON.stringify({
+      type: 'question_list',
+      questions,
+      count: questions.length,
+      timestamp: Date.now()
+    }));
+
+    console.log(`[Questions] Sent ${questions.length} visible question(s) to ${connection.tag || 'unregistered'} (${connection.role})`);
+
+  } catch (error) {
+    console.error('Error sending question list:', error);
+    ws.send(JSON.stringify({ type: 'error', message: 'Error fetching questions' }));
+  }
+}
+
+// Generate unique connection ID
   const connectionId = generateConnectionId();
   
   // Generate JWT token for this device
@@ -133,7 +373,7 @@ wss.on('connection', async (ws, req) => {
 
       switch (message.type) {
         case 'register_tag':
-          await handleTagRegistration(ws, message.tag);
+          await handleTagRegistration(ws, message.tag, message.role);
           break;
         case 'unregister_tag':
           await handleTagUnregistration(ws);
@@ -152,6 +392,16 @@ wss.on('connection', async (ws, req) => {
           break;
         case 'get_cubes':
           await sendCubeList(ws);
+          break;
+        case 'send_question':
+        case 'send_private_question':
+          await handleQuestion(ws, message, connection);
+          break;
+        case 'resolve_question':
+          await handleResolveQuestion(ws, message, connection);
+          break;
+        case 'get_questions':
+          await sendQuestionList(ws, connection);
           break;
         case 'ping':
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
@@ -201,7 +451,7 @@ wss.on('connection', async (ws, req) => {
 });
 
 // Handle tag registration
-async function handleTagRegistration(ws, requestedTag) {
+async function handleTagRegistration(ws, requestedTag, requestedRole) {
   const connection = activeConnections.get(ws);
   
   if (!connection) {
@@ -261,11 +511,14 @@ async function handleTagRegistration(ws, requestedTag) {
       active: true,
       registeredAt: admin.firestore.FieldValue.serverTimestamp(),
       lastSeen: admin.firestore.FieldValue.serverTimestamp(),
-      ip: connection.ip
+      ip: connection.ip,
+      role: validRoles.includes(requestedRole) ? requestedRole : 'student'
     });
 
-    // Update connection with new tag
+    // Update connection with new tag and role
     connection.tag = sanitizedTag;
+    const validRoles = ['student', 'staff', 'admin'];
+    connection.role = validRoles.includes(requestedRole) ? requestedRole : 'student';
 
     console.log(`Tag registered: ${sanitizedTag} (${connection.connectionId})`);
 
@@ -716,8 +969,8 @@ process.on('SIGINT', async () => {
 // Start server
 const PORT = process.env.PORT || 8080;
 
-// Load cubes from Firebase before starting the server
-loadCubesFromFirebase().then(() => {
+// Load cubes and questions from Firebase before starting the server
+Promise.all([loadCubesFromFirebase(), loadQuestionsFromFirebase()]).then(() => {
   server.listen(PORT, () => {
     console.log(`Flock Server running on port ${PORT}`);
     console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
@@ -725,8 +978,8 @@ loadCubesFromFirebase().then(() => {
     console.log(`Cubes cache initialized with ${cubesCache.size} cubes`);
   });
 }).catch(error => {
-  console.error('Failed to load cubes on startup:', error);
+  console.error('Failed to load data on startup:', error);
   server.listen(PORT, () => {
-    console.log(`Flock Server running on port ${PORT} (cube load failed, will try again on next request)`);
+    console.log(`Flock Server running on port ${PORT} (initial load failed, will try again on next request)`);
   });
 });
