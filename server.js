@@ -74,23 +74,6 @@ const questionsCache = new Map();  // questionId -> question data (persists acro
 const RATE_LIMIT_WINDOW = parseInt(process.env.RATE_LIMIT_WINDOW) || 60000;
 const MAX_CONNECTIONS_PER_IP = parseInt(process.env.MAX_CONNECTIONS_PER_IP) || 5;
 
-// Handle connections
-wss.on('connection', async (ws, req) => {
-  const ip = req.socket.remoteAddress;
-  console.log(`New connection from ${ip}`);
-
-  // Rate limiting check
-  const currentConnections = ipConnectionCount.get(ip) || 0;
-  if (currentConnections >= MAX_CONNECTIONS_PER_IP) {
-    console.log(`Rate limit exceeded for ${ip}`);
-    ws.close(1008, 'Too many connections from this IP');
-    return;
-  }
-
-  // Increment connection count
-  ipConnectionCount.set(ip, currentConnections + 1);
-
-  
 // ─────────────────────────────────────────────────────────────────────────────
 // QUESTION HANDLERS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -312,6 +295,22 @@ async function sendQuestionList(ws, connection) {
   }
 }
 
+// Handle connections
+wss.on('connection', async (ws, req) => {
+  const ip = req.socket.remoteAddress;
+  console.log(`New connection from ${ip}`);
+
+  // Rate limiting check
+  const currentConnections = ipConnectionCount.get(ip) || 0;
+  if (currentConnections >= MAX_CONNECTIONS_PER_IP) {
+    console.log(`Rate limit exceeded for ${ip}`);
+    ws.close(1008, 'Too many connections from this IP');
+    return;
+  }
+
+  // Increment connection count
+  ipConnectionCount.set(ip, currentConnections + 1);
+
 // Generate unique connection ID
   const connectionId = generateConnectionId();
   
@@ -505,6 +504,7 @@ async function handleTagRegistration(ws, requestedTag, requestedRole) {
     }
 
     // Register new tag in Firebase
+    const validRoles = ['student', 'staff', 'admin'];
     await tagsCollection.doc(sanitizedTag).set({
       tag: sanitizedTag,
       connectionId: connection.connectionId,
@@ -517,7 +517,6 @@ async function handleTagRegistration(ws, requestedTag, requestedRole) {
 
     // Update connection with new tag and role
     connection.tag = sanitizedTag;
-    const validRoles = ['student', 'staff', 'admin'];
     connection.role = validRoles.includes(requestedRole) ? requestedRole : 'student';
 
     console.log(`Tag registered: ${sanitizedTag} (${connection.connectionId})`);
