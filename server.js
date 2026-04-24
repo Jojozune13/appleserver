@@ -65,7 +65,7 @@ async function loadQuestionsFromFirebase() {
 }
 
 // In-memory storage for active connections
-const activeConnections = new Map(); // socket -> { tag, connectionId, lastSeen, ip, token }
+const activeConnections = new Map(); // socket -> { tag, connectionId, lastSeen, ip, token, ws }
 const ipConnectionCount = new Map(); // ip -> count (for rate limiting)
 const cubesCache = new Map();     // cubeId -> cube data (persists across client connections)
 const questionsCache = new Map();  // questionId -> question data (persists across client connections)
@@ -80,12 +80,12 @@ const MAX_CONNECTIONS_PER_IP = parseInt(process.env.MAX_CONNECTIONS_PER_IP) || 5
 
 // Helper: does this connection's role allow seeing private questions?
 function canSeePrivate(connection) {
-  return connection.role === 'admin' || connection.role === 'staff';
+  return connection.role === 'admin' || connection.role === 'staff' || connection.role === 'peerMentor';
 }
 
 // Helper: does this connection's role allow resolving questions?
 function canResolve(connection) {
-  return connection.role === 'admin' || connection.role === 'staff';
+  return connection.role === 'admin' || connection.role === 'staff' || connection.role === 'peerMentor';
 }
 
 // Handle send_question / send_private_question
@@ -152,7 +152,7 @@ function broadcastQuestion(questionData, senderConnectionId) {
     if (conn.connectionId === senderConnectionId) return; // sender already sees it locally
 
     // Private question routing:
-    //   • admins and staff always receive it
+    //   • admins, staff and peer mentors always receive it
     //   • the targeted user (if any) receives it
     //   • everyone else does NOT
     if (isPrivate) {
@@ -181,9 +181,9 @@ async function handleResolveQuestion(ws, message, connection) {
     return;
   }
 
-  // Role gate — only staff and admin may resolve
+  // Role gate — only staff, admin, and peer mentors may resolve
   if (!canResolve(connection)) {
-    ws.send(JSON.stringify({ type: 'error', message: 'Only staff or admin can resolve questions' }));
+    ws.send(JSON.stringify({ type: 'error', message: 'Only staff, admin, or peer mentors can resolve questions' }));
     return;
   }
 
@@ -261,7 +261,7 @@ async function sendQuestionList(ws, connection) {
       // Apply the same private-visibility rules as the client
       if (q.isPrivate) {
         if (!canSeePrivate(connection)) {
-          // Student: only see their own private questions (as asker or target)
+          // Student/peer mentor: only see their own private questions (as asker or target)
           const isAsker  = connection.tag && q.askedBy    === connection.tag;
           const isTarget = connection.tag && q.targetUser === connection.tag;
           if (!isAsker && !isTarget) return;
@@ -295,6 +295,112 @@ async function sendQuestionList(ws, connection) {
   }
 }
 
+// Handle update_role (self-promotion or admin/staff setting another user's role)
+async function handleUpdateRole(ws, message, connection) {
+  if (!connection.tag) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Must be registered to change roles' }));
+    return;
+  }
+
+  const targetTag = message.targetTag || connection.tag;   // if not specified, update self
+  const newRole  = message.role;
+
+  // Validate new role
+  const validRoles = ['student', 'peerMentor', 'staff', 'admin'];
+  if (!validRoles.includes(newRole)) {
+    ws.send(JSON.stringify({ type: 'error', message: `Invalid role: ${newRole}` }));
+    return;
+  }
+
+  try {
+    // ----- Case 1: User updates their own role (self-promotion) -----
+    if (targetTag === connection.tag) {
+      // For now, only allow student <-> peerMentor transition
+      const currentRole = connection.role;
+      if (currentRole === 'student' && newRole === 'peerMentor') {
+        // Allow
+      } else if (currentRole === 'peerMentor' && newRole === 'student') {
+        // Optional: allow demotion back to student
+      } else {
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: 'You can only toggle between student and peer mentor'
+        }));
+        return;
+      }
+
+      // Update in-memory connection
+      connection.role = newRole;
+
+      // Update Firebase
+      await tagsCollection.doc(connection.tag).update({ role: newRole });
+
+      ws.send(JSON.stringify({
+        type: 'role_updated',
+        success: true,
+        tag: connection.tag,
+        role: newRole,
+        message: `Your role is now ${newRole}`
+      }));
+
+      console.log(`[Role] ${connection.tag} self-promoted to ${newRole}`);
+      return;
+    }
+
+    // ----- Case 2: Admin/staff changes another user's role -----
+    if (connection.role !== 'admin' && connection.role !== 'staff') {
+      ws.send(JSON.stringify({ type: 'error', message: 'Only staff or admin can change other users\' roles' }));
+      return;
+    }
+
+    // Update the target's Firestore document
+    const targetDoc = await tagsCollection.doc(targetTag).get();
+    if (!targetDoc.exists) {
+      ws.send(JSON.stringify({ type: 'error', message: 'Target user not found' }));
+      return;
+    }
+
+    await tagsCollection.doc(targetTag).update({ role: newRole });
+
+    // If the target user is currently connected, push the change to them
+    let targetConnection = null;
+    let targetWs = null;
+    activeConnections.forEach((conn, client) => {
+      if (conn.tag === targetTag && client.readyState === WebSocket.OPEN) {
+        targetConnection = conn;
+        targetWs = client;
+      }
+    });
+
+    if (targetConnection) {
+      targetConnection.role = newRole;
+      // Send a role_changed event so the target's client updates its UI
+      if (targetWs) {
+        targetWs.send(JSON.stringify({
+          type: 'role_changed',
+          tag: targetTag,
+          role: newRole,
+          changedBy: connection.tag
+        }));
+      }
+    }
+
+    ws.send(JSON.stringify({
+      type: 'role_set',
+      success: true,
+      targetTag,
+      newRole,
+      message: `${targetTag}'s role set to ${newRole}`
+    }));
+
+    console.log(`[Role] ${connection.tag} (${connection.role}) set ${targetTag}'s role to ${newRole}`);
+
+  } catch (error) {
+    console.error('Error updating role:', error);
+    ws.send(JSON.stringify({ type: 'error', message: 'Server error updating role' }));
+  }
+}
+
 // Handle connections
 wss.on('connection', async (ws, req) => {
   const ip = req.socket.remoteAddress;
@@ -321,9 +427,10 @@ wss.on('connection', async (ws, req) => {
     { expiresIn: TOKEN_EXPIRY }
   );
   
-  // Store connection
+  // Store connection — now includes ws reference for role updates
   activeConnections.set(ws, {
     tag: null,
+    ws: ws,            // store WebSocket reference
     connectionId,
     ip,
     token,
@@ -401,6 +508,9 @@ wss.on('connection', async (ws, req) => {
           break;
         case 'get_questions':
           await sendQuestionList(ws, connection);
+          break;
+        case 'update_role':
+          await handleUpdateRole(ws, message, connection);
           break;
         case 'ping':
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
@@ -504,7 +614,7 @@ async function handleTagRegistration(ws, requestedTag, requestedRole) {
     }
 
     // Register new tag in Firebase
-    const validRoles = ['student', 'staff', 'admin'];
+    const validRoles = ['student', 'peerMentor', 'staff', 'admin'];
     await tagsCollection.doc(sanitizedTag).set({
       tag: sanitizedTag,
       connectionId: connection.connectionId,
